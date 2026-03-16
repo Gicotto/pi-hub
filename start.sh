@@ -22,6 +22,11 @@ FRONTEND_PORT=5174
 
 BACKEND_PID=""
 FRONTEND_PID=""
+CHROMIUM_PID=""
+
+# Pass --no-kiosk to skip opening Chromium
+KIOSK=true
+for arg in "$@"; do [[ "$arg" == "--no-kiosk" ]] && KIOSK=false; done
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,8 +49,11 @@ free_port() {
 cleanup() {
   echo ""
   info "Shutting down…"
-  [[ -n "$BACKEND_PID"  ]] && kill "$BACKEND_PID"  2>/dev/null || true
+  [[ -n "$CHROMIUM_PID" ]] && kill "$CHROMIUM_PID" 2>/dev/null || true
   [[ -n "$FRONTEND_PID" ]] && kill "$FRONTEND_PID" 2>/dev/null || true
+  # Backend may be running under sudo — kill by port as a reliable fallback
+  [[ -n "$BACKEND_PID"  ]] && kill "$BACKEND_PID"  2>/dev/null || true
+  free_port "$BACKEND_PORT"
   info "Goodbye."
 }
 trap cleanup EXIT INT TERM
@@ -62,7 +70,8 @@ PY_VERSION=$(python3 -c 'import sys; print(sys.version_info.minor)')
 [[ "$PY_VERSION" -ge 10 ]] || die "Python 3.10+ is required (found 3.${PY_VERSION})"
 
 NODE_MAJOR=$(node -e 'process.stdout.write(process.versions.node.split(".")[0])')
-[[ "$NODE_MAJOR" -ge 18 ]] || die "Node.js 18+ is required (found v$(node -e 'process.stdout.write(process.versions.node)'))"
+[[ "$NODE_MAJOR" -ge 20 ]] || die "Node.js 20+ is required (found v$(node -e 'process.stdout.write(process.versions.node)')).
+  Upgrade with: curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs"
 
 success "System requirements OK"
 
@@ -90,15 +99,20 @@ success "Frontend dependencies ready"
 free_port "$BACKEND_PORT"
 free_port "$FRONTEND_PORT"
 
-# ── Start backend ─────────────────────────────────────────────────────────────
+# ── Start backend (needs root for nmap ARP + OS detection) ───────────────────
 info "Starting backend on port ${BACKEND_PORT}…"
-(cd "$BACKEND_DIR" && \
-  "$VENV/bin/uvicorn" main:app \
-    --host 0.0.0.0 \
-    --port "$BACKEND_PORT" \
-    --reload \
-) &
-BACKEND_PID=$!
+if [[ "$EUID" -eq 0 ]]; then
+  # Already root — run directly
+  (cd "$BACKEND_DIR" && "$VENV/bin/uvicorn" main:app --host 0.0.0.0 --port "$BACKEND_PORT") &
+  BACKEND_PID=$!
+else
+  # Not root — use sudo so nmap can open raw sockets
+  warn "nmap requires root for ARP scanning and OS detection — using sudo for the backend"
+  warn "You will be prompted for your password once."
+  sudo --validate || die "sudo authentication failed"
+  sudo --non-interactive bash -c "cd '$BACKEND_DIR' && '$VENV/bin/uvicorn' main:app --host 0.0.0.0 --port '$BACKEND_PORT'" &
+  BACKEND_PID=$!
+fi
 
 # Wait for backend to be reachable (up to 15 s)
 info "Waiting for backend to be ready…"
@@ -136,6 +150,39 @@ for i in $(seq 1 30); do
   fi
 done
 
+# ── Launch Chromium kiosk (Pi display only) ───────────────────────────────────
+if $KIOSK; then
+  # Find whichever Chromium binary is installed
+  CHROMIUM_BIN=""
+  for bin in chromium-browser chromium google-chrome; do
+    if command -v "$bin" &>/dev/null; then
+      CHROMIUM_BIN="$bin"
+      break
+    fi
+  done
+
+  if [[ -z "$CHROMIUM_BIN" ]]; then
+    warn "Chromium not found — skipping kiosk mode. Install with: sudo apt install chromium-browser"
+  elif [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    warn "No display detected — skipping kiosk mode (run with a monitor attached)"
+  else
+    info "Launching kiosk: ${CHROMIUM_BIN}"
+    "$CHROMIUM_BIN" \
+      --kiosk \
+      --app="http://localhost:${FRONTEND_PORT}" \
+      --no-first-run \
+      --disable-infobars \
+      --disable-session-crashed-bubble \
+      --noerrdialogs \
+      --check-for-update-interval=31536000 \
+      --disable-pinch \
+      --overscroll-history-navigation=0 \
+      &>/dev/null &
+    CHROMIUM_PID=$!
+    success "Kiosk launched (PID ${CHROMIUM_PID})"
+  fi
+fi
+
 echo ""
 echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo -e "${BOLD}  Pi-Hub is running${RESET}"
@@ -144,10 +191,10 @@ echo -e "  ${BOLD}App${RESET}      →  http://localhost:${FRONTEND_PORT}"
 echo -e "  ${BOLD}API${RESET}      →  http://localhost:${BACKEND_PORT}"
 echo -e "  ${BOLD}API docs${RESET} →  http://localhost:${BACKEND_PORT}/docs"
 echo -e ""
-echo -e "  Press ${BOLD}Ctrl+C${RESET} to stop both servers"
+echo -e "  Press ${BOLD}Ctrl+C${RESET} to stop all processes"
 echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
 
-# Keep script alive — let both child processes stream their output
+# Keep script alive — let child processes stream their output
 wait
 
